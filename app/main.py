@@ -5,9 +5,15 @@
 - 封存后正文不可改；开封前任何查询与错误响应都不返回正文；
 - 开封请求需两名不同指定见证人在截止时刻前分别同意，同一人重试只计一次；
 - 同意必须绑定本次请求与封存时的摘要（客户端提交摘要，服务端比对）；
+- 开封请求可选带时区的 earliest_open_at（最早开封时刻）：
+  未填写时两票集齐即开封；填写后两票在该时刻前集齐只进入 waiting（待开封），
+  到点自动开封；到点时不足两票的，截止前补齐第二票时立即开封；
 - 撤销或到期后旧同意永久失效，不能用于后续请求；
-- 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销只有一个已提交结果；
-- 每次操作按顺序追加到 audit_log，SQLite 持久化，重启状态一致。
+- 已 waiting（未撤销、两票集齐）的请求到点必开封：后台扫描器与每个写事务
+  都会先做确定性的“到点开封”判定，即使处理延迟，之后的撤销或到期扫描也无法使其失效；
+- 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
+  到期处理只有一个已提交结果；
+- 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 """
 import asyncio
 import hashlib
@@ -52,8 +58,63 @@ def add_audit(
 
 
 # ---------------------------------------------------------------------------
-# 过期扫描：把已到截止时刻仍 pending 的请求置为 expired
+# 定时开封 / 过期扫描
+#
+# 到点开封（waiting -> opened）与到期失效（pending -> expired）共用同一把
+# 串行化写锁。waiting 请求到点后只能开封：任何写临界区内都先做“到点开封”
+# 判定，因此即便后台处理延迟，之后到达的撤销或到期扫描也无法将其作废。
 # ---------------------------------------------------------------------------
+
+
+def open_request_now(
+    tx: sqlite3.Connection,
+    *,
+    req_id: int,
+    doc_id: int,
+    now: str,
+    actor_id: int | None = None,
+    detail: str = "已到最早开封时刻且两名不同指定见证人均已同意，资料自动开封",
+) -> None:
+    """在已持有的写事务内把资料与请求置为 opened 并追加审计。"""
+    tx.execute(
+        "UPDATE documents SET status='opened', opened_at=? WHERE id=? AND status='sealed'",
+        (now, doc_id),
+    )
+    tx.execute(
+        "UPDATE open_requests SET status='opened', resolved_at=? WHERE id=?",
+        (now, req_id),
+    )
+    add_audit(
+        tx,
+        actor_id=actor_id,
+        action="opened",
+        document_id=doc_id,
+        request_id=req_id,
+        detail=detail,
+    )
+
+
+def resolve_due_waiting(tx: sqlite3.Connection, now: str, request_id: int | None = None) -> int:
+    """在已持有的写事务内把已到最早开封时刻的 waiting 请求确定性开封。
+
+    所有写路径（同意/撤销/新建请求/后台扫描）进入临界区后都先调用本函数，
+    保证“到点必开封”不依赖后台扫描器的及时性。返回本次开封条数。
+    """
+    if request_id is not None:
+        rows = tx.execute(
+            "SELECT id, document_id FROM open_requests"
+            " WHERE id = ? AND status = 'waiting' AND earliest_open_at <= ?",
+            (request_id, now),
+        ).fetchall()
+    else:
+        rows = tx.execute(
+            "SELECT id, document_id FROM open_requests"
+            " WHERE status = 'waiting' AND earliest_open_at <= ?",
+            (now,),
+        ).fetchall()
+    for row in rows:
+        open_request_now(tx, req_id=row["id"], doc_id=row["document_id"], now=now)
+    return len(rows)
 
 
 class ExpirySweeper:
@@ -62,6 +123,7 @@ class ExpirySweeper:
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
+        self._stop = asyncio.Event()  # 允许同一进程内停止后再次启动（测试/多服务）
         await asyncio.to_thread(init_db)
         await asyncio.to_thread(self.sweep_once)  # 重启后先恢复一次
         self._task = asyncio.create_task(self._run())
@@ -85,11 +147,16 @@ class ExpirySweeper:
 
     @staticmethod
     def sweep_once() -> int:
-        """把 deadline<=now 的 pending 请求标记为 expired；返回失效条数。"""
+        """一轮定时处理：先把到点的 waiting 请求开封，再把过截止时刻仍
+        pending（票数不足）的请求置为 expired；返回失效（expired）条数。"""
         conn = connect()
         try:
             with write_tx(conn) as tx:
                 now = utc_str(now_utc())
+                # 第一步：到点开封。waiting 必然满足 earliest_open_at < deadline，
+                # 到点即生效，永远不会走到下面的过期分支。
+                resolve_due_waiting(tx, now)
+                # 第二步：到截止时刻仍未集齐两票（pending）的请求失效。
                 rows = tx.execute(
                     "SELECT id, document_id FROM open_requests"
                     " WHERE status = 'pending' AND deadline <= ?",
@@ -127,7 +194,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -341,6 +408,7 @@ def get_document(
                 "request_id": latest["id"],
                 "reason": latest["reason"],
                 "deadline": latest["deadline"],
+                "earliest_open_at": latest["earliest_open_at"],
                 "status": latest["status"],
                 "created_at": latest["created_at"],
                 "resolved_at": latest["resolved_at"],
@@ -359,6 +427,7 @@ def get_document(
                 "request_id": latest["id"],
                 "reason": latest["reason"],
                 "deadline": latest["deadline"],
+                "earliest_open_at": latest["earliest_open_at"],
                 "status": latest["status"],
                 "created_at": latest["created_at"],
                 "approval_count": db.execute(
@@ -386,50 +455,56 @@ def create_open_request(
         raise err(403, "只有封存人可以提交开封请求")
 
     deadline = utc_str(payload.deadline)
+    earliest = utc_str(payload.earliest_open_at) if payload.earliest_open_at else None
     now = utc_str(now_utc())
     if deadline <= now:
         raise err(400, "截止时刻必须晚于当前时间")
+    if earliest is not None and earliest < now:
+        raise err(400, "最早开封时刻不能早于当前时间")
 
     with write_tx(db) as tx:
-        # 锁内重读，避免与同意/撤销/扫描并发
+        # 锁内先处理到点的定时开封，避免与同意/撤销/扫描并发
+        resolve_due_waiting(tx, now)
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
         if doc["status"] != "sealed":
             raise err(409, "资料已开封，重复开封被拒绝")
-        pending = tx.execute(
-            "SELECT id, deadline FROM open_requests WHERE document_id = ? AND status = 'pending'",
+        active = tx.execute(
+            "SELECT id, deadline FROM open_requests"
+            " WHERE document_id = ? AND status IN ('pending', 'waiting')",
             (doc_id,),
         ).fetchone()
-        if pending is not None:
-            if pending["deadline"] <= now:
+        if active is not None:
+            if active["deadline"] <= now:
                 # 理论上扫描器很快会处理；在同一临界区内顺手确定性失效
                 tx.execute(
                     "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
-                    (now, pending["id"]),
+                    (now, active["id"]),
                 )
                 add_audit(
                     tx,
                     actor_id=None,
                     action="request_expired",
                     document_id=doc_id,
-                    request_id=pending["id"],
+                    request_id=active["id"],
                     detail="旧开封请求已过截止时刻，提交新请求时确认失效，旧同意作废",
                 )
             else:
                 raise err(409, "已有进行中的开封请求，请先撤销或等待其到期")
 
         cur = tx.execute(
-            "INSERT INTO open_requests (document_id, reason, deadline, status, created_at)"
-            " VALUES (?, ?, ?, 'pending', ?)",
-            (doc_id, payload.reason, deadline, now),
+            "INSERT INTO open_requests (document_id, reason, deadline, status, created_at, earliest_open_at)"
+            " VALUES (?, ?, ?, 'pending', ?, ?)",
+            (doc_id, payload.reason, deadline, now, earliest),
         )
         request_id = cur.lastrowid
+        timing = f"最早开封时刻: {earliest}" if earliest else "未指定最早开封时刻，两票集齐即开封"
         add_audit(
             tx,
             actor_id=user["id"],
             action="open_request_created",
             document_id=doc_id,
             request_id=request_id,
-            detail=f"提交开封请求，理由: {payload.reason}；截止时刻: {deadline}",
+            detail=f"提交开封请求，理由: {payload.reason}；截止时刻: {deadline}；{timing}",
         )
 
     return {
@@ -438,6 +513,7 @@ def create_open_request(
         "status": "pending",
         "reason": payload.reason,
         "deadline": deadline,
+        "earliest_open_at": earliest,
     }
 
 
@@ -454,7 +530,7 @@ def approve_open_request(
     """
     meta = db.execute(
         """SELECT r.id AS request_id, r.document_id, r.status AS req_status,
-                  r.deadline, d.status AS doc_status, d.digest
+                  r.deadline, r.earliest_open_at, d.status AS doc_status, d.digest
            FROM open_requests r JOIN documents d ON d.id = r.document_id
            WHERE r.id = ?""",
         (request_id,),
@@ -469,8 +545,15 @@ def approve_open_request(
         raise err(403, "只有指定见证人可以同意")
 
     now = utc_str(now_utc())
+    # 到点开封必须先落库：若本请求因此开封而本次同意仍需拒绝，要等事务提交后再抛错，
+    # 绝不能让回滚把已经生效的开封撤销。
+    post_commit_error: HTTPException | None = None
+    response: dict[str, Any] | None = None
     try:
         with write_tx(db) as tx:
+            # 临界区第一步：到点的 waiting 请求必开封；之后任何状态判定都以开封为准，
+            # 因此定时开封即使被后台延迟处理，也不会被并发同意/撤销/扫描作废。
+            due_opened = resolve_due_waiting(tx, now, request_id) > 0
             req = tx.execute(
                 "SELECT * FROM open_requests WHERE id = ?", (request_id,)
             ).fetchone()
@@ -479,68 +562,90 @@ def approve_open_request(
             ).fetchone()
 
             if doc["status"] != "sealed":
-                raise err(409, "资料已开封，重复开封被拒绝")
-            if req["status"] != "pending":
+                if due_opened:
+                    post_commit_error = err(409, "资料已开封，重复开封被拒绝")
+                else:
+                    raise err(409, "资料已开封，重复开封被拒绝")
+            elif req["status"] == "waiting":
+                raise err(409, "两票已集齐，待到达最早开封时刻自动开封，同意被拒绝")
+            elif req["status"] != "pending":
                 raise err(409, f"开封请求当前状态为 {req['status']}，同意被拒绝")
-            if req["deadline"] <= now:
+            elif req["deadline"] <= now:
                 raise err(409, "已过截止时刻，同意被拒绝，请求即将失效")
-            if payload.digest != doc["digest"]:
+            elif payload.digest != doc["digest"]:
                 # 不同意即不绑定本次请求：不落库
                 raise err(409, "提交的摘要与封存时摘要不一致，拒绝同意")
-            already = tx.execute(
-                "SELECT 1 FROM approvals WHERE request_id = ? AND witness_id = ?",
-                (request_id, user["id"]),
-            ).fetchone()
-            if already is not None:
-                raise err(409, "你已同意本次请求，重复提交只计一次")
+            else:
+                already = tx.execute(
+                    "SELECT 1 FROM approvals WHERE request_id = ? AND witness_id = ?",
+                    (request_id, user["id"]),
+                ).fetchone()
+                if already is not None:
+                    raise err(409, "你已同意本次请求，重复提交只计一次")
 
-            tx.execute(
-                "INSERT INTO approvals (request_id, witness_id, bound_digest, created_at)"
-                " VALUES (?, ?, ?, ?)",
-                (request_id, user["id"], doc["digest"], now),
-            )
-            add_audit(
-                tx,
-                actor_id=user["id"],
-                action="approval",
-                document_id=doc["id"],
-                request_id=request_id,
-                detail="见证人同意开封，已绑定本次请求与封存摘要",
-            )
-
-            count = tx.execute(
-                "SELECT COUNT(*) AS c FROM approvals WHERE request_id = ?", (request_id,)
-            ).fetchone()["c"]
-
-            opened = False
-            if count >= 2:
-                # 第二名不同见证人到位：开封。UNIQUE(request_id, witness_id)
-                # 保证两名同意必然来自不同见证人。
                 tx.execute(
-                    "UPDATE documents SET status='opened', opened_at=? WHERE id=?",
-                    (now, doc["id"]),
-                )
-                tx.execute(
-                    "UPDATE open_requests SET status='opened', resolved_at=? WHERE id=?",
-                    (now, request_id),
+                    "INSERT INTO approvals (request_id, witness_id, bound_digest, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (request_id, user["id"], doc["digest"], now),
                 )
                 add_audit(
                     tx,
                     actor_id=user["id"],
-                    action="opened",
+                    action="approval",
                     document_id=doc["id"],
                     request_id=request_id,
-                    detail="两名不同指定见证人均已同意，资料正式开封",
+                    detail="见证人同意开封，已绑定本次请求与封存摘要",
                 )
-                opened = True
 
-            return {
-                "request_id": request_id,
-                "document_id": doc["id"],
-                "approval_count": count,
-                "required": 2,
-                "status": "opened" if opened else "pending",
-            }
+                count = tx.execute(
+                    "SELECT COUNT(*) AS c FROM approvals WHERE request_id = ?", (request_id,)
+                ).fetchone()["c"]
+
+                new_status = "pending"
+                if count >= 2:
+                    # 第二名不同见证人到位。UNIQUE(request_id, witness_id)
+                    # 保证两名同意必然来自不同见证人。
+                    earliest = req["earliest_open_at"]
+                    if earliest is None or earliest <= now:
+                        # 未设最早开封时刻（集齐即开），或已到最早开封时刻：立即开封
+                        open_request_now(
+                            tx,
+                            req_id=request_id,
+                            doc_id=doc["id"],
+                            now=now,
+                            actor_id=user["id"],
+                            detail="两名不同指定见证人均已同意，资料正式开封",
+                        )
+                        new_status = "opened"
+                    else:
+                        # 两票在最早开封时刻前集齐：只进入待开封，到点自动开封
+                        tx.execute(
+                            "UPDATE open_requests SET status='waiting' WHERE id=?",
+                            (request_id,),
+                        )
+                        add_audit(
+                            tx,
+                            actor_id=user["id"],
+                            action="request_waiting",
+                            document_id=doc["id"],
+                            request_id=request_id,
+                            detail=f"两名不同指定见证人均已同意，待最早开封时刻 {earliest} 自动开封",
+                        )
+                        new_status = "waiting"
+
+                response = {
+                    "request_id": request_id,
+                    "document_id": doc["id"],
+                    "approval_count": count,
+                    "required": 2,
+                    "status": new_status,
+                }
+                if req["earliest_open_at"] is not None:
+                    response["earliest_open_at"] = req["earliest_open_at"]
+        if post_commit_error is not None:
+            raise post_commit_error
+        assert response is not None
+        return response
     except sqlite3.IntegrityError:
         # 唯一约束兜底（并发重复同意）
         raise err(409, "你已同意本次请求，重复提交只计一次")
@@ -565,27 +670,37 @@ def revoke_open_request(
         raise err(403, "只有封存人可以撤销开封请求")
 
     now = utc_str(now_utc())
+    # 与同意相同：到点开封先提交，拒绝（撤销已随开封失效的请求）在提交后再返回。
+    post_commit_error: HTTPException | None = None
     with write_tx(db) as tx:
+        due_opened = resolve_due_waiting(tx, now, request_id) > 0
         req = tx.execute("SELECT * FROM open_requests WHERE id = ?", (request_id,)).fetchone()
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (req["document_id"],)).fetchone()
         if doc["status"] != "sealed":
-            raise err(409, "资料已开封，无法撤销")
-        if req["status"] != "pending":
+            if due_opened:
+                post_commit_error = err(409, "资料已开封，无法撤销")
+            else:
+                raise err(409, "资料已开封，无法撤销")
+        elif req["status"] not in ("pending", "waiting"):
             raise err(409, f"开封请求当前状态为 {req['status']}，无法撤销")
-        if req["deadline"] <= now:
+        elif req["deadline"] <= now:
             raise err(409, "已过截止时刻，不能撤销，请求即将失效")
-        tx.execute(
-            "UPDATE open_requests SET status='revoked', resolved_at=? WHERE id=?",
-            (now, request_id),
-        )
-        add_audit(
-            tx,
-            actor_id=user["id"],
-            action="revoked",
-            document_id=req["document_id"],
-            request_id=request_id,
-            detail=f"封存人撤销开封请求，已有同意全部作废。原因: {payload.reason or '（未填写）'}",
-        )
+        else:
+            waiting_note = "（请求已集齐两票，待到点开封）" if req["status"] == "waiting" else ""
+            tx.execute(
+                "UPDATE open_requests SET status='revoked', resolved_at=? WHERE id=?",
+                (now, request_id),
+            )
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="revoked",
+                document_id=req["document_id"],
+                request_id=request_id,
+                detail=f"封存人撤销开封请求{waiting_note}，已有同意全部作废。原因: {payload.reason or '（未填写）'}",
+            )
+    if post_commit_error is not None:
+        raise post_commit_error
     return {"request_id": request_id, "status": "revoked"}
 
 

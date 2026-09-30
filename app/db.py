@@ -4,6 +4,7 @@
 把“检查状态 -> 写入”放入同一个串行化临界区，保证并发同意/撤销
 只能有一个已提交结果。
 """
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -41,13 +42,14 @@ CREATE TABLE IF NOT EXISTS document_witnesses (
 );
 
 CREATE TABLE IF NOT EXISTS open_requests (
-    id           INTEGER PRIMARY KEY,
-    document_id  INTEGER NOT NULL REFERENCES documents(id),
-    reason       TEXT NOT NULL,
-    deadline     TEXT NOT NULL,            -- UTC，固定微秒精度，可直接按字典序比较
-    status       TEXT NOT NULL CHECK (status IN ('pending', 'opened', 'revoked', 'expired')),
-    created_at   TEXT NOT NULL,
-    resolved_at  TEXT
+    id               INTEGER PRIMARY KEY,
+    document_id      INTEGER NOT NULL REFERENCES documents(id),
+    reason           TEXT NOT NULL,
+    deadline         TEXT NOT NULL,            -- UTC，固定微秒精度，可直接按字典序比较
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'waiting', 'opened', 'revoked', 'expired')),
+    created_at       TEXT NOT NULL,
+    resolved_at      TEXT,
+    earliest_open_at TEXT                      -- 可空：最早开封时刻；两票到齐但未到该时刻时状态为 waiting
 );
 CREATE INDEX IF NOT EXISTS idx_open_requests_document ON open_requests(document_id);
 
@@ -87,11 +89,44 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# 旧库迁移（幂等）：补 earliest_open_at 列，并在 CHECK 约束不含 waiting 时重建表
+_WAITING_CHECK = re.compile(r"CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)", re.IGNORECASE)
+_MIGRATION_REBUILD = """
+CREATE TABLE open_requests_new (
+    id               INTEGER PRIMARY KEY,
+    document_id      INTEGER NOT NULL REFERENCES documents(id),
+    reason           TEXT NOT NULL,
+    deadline         TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'waiting', 'opened', 'revoked', 'expired')),
+    created_at       TEXT NOT NULL,
+    resolved_at      TEXT,
+    earliest_open_at TEXT
+);
+INSERT INTO open_requests_new (id, document_id, reason, deadline, status, created_at, resolved_at, earliest_open_at)
+SELECT id, document_id, reason, deadline, status, created_at, resolved_at, NULL FROM open_requests;
+DROP TABLE open_requests;
+ALTER TABLE open_requests_new RENAME TO open_requests;
+CREATE INDEX IF NOT EXISTS idx_open_requests_document ON open_requests(document_id);
+"""
+
+
 def init_db(db_path: str | None = None) -> None:
     """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。"""
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # 旧版库迁移：CREATE TABLE IF NOT EXISTS 不会更新既有表结构
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(open_requests)")}
+        if "earliest_open_at" not in cols:
+            conn.execute("ALTER TABLE open_requests ADD COLUMN earliest_open_at TEXT")
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='open_requests'"
+        ).fetchone()["sql"]
+        m = _WAITING_CHECK.search(sql)
+        if m is None or "'waiting'" not in m.group(1).replace('"', "'").lower():
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(_MIGRATION_REBUILD)
+            conn.execute("PRAGMA foreign_keys=ON")
         conn.commit()
     finally:
         conn.close()

@@ -180,6 +180,133 @@ def test_concurrent_approve_vs_revoke_single_outcome(live_server):
         assert [r["action"] for r in records].count("revoked") <= 1
 
 
+def test_waiting_opens_automatically_and_survives_late_revoke(live_server):
+    """真实后台扫描：waiting 到点自动开封；即使处理延迟，迟到的撤销也不能作废。"""
+    base, _ = live_server
+    with httpx.Client(timeout=10) as c:
+        owner = _reg(c, base, "sched-owner")
+        w1 = _reg(c, base, "s1")
+        w2 = _reg(c, base, "s2")
+        w3 = _reg(c, base, "s3")
+        body = "定时开封正文 SCHEDULED-LIVE-SECRET"
+        dg = _digest(body)
+        doc_id = c.post(base + "/documents", json={"body": body, "witnesses": ["s1", "s2", "s3"]},
+                        headers={"X-API-Key": owner}).json()["document_id"]
+        earliest = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)).isoformat()
+        deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)).isoformat()
+        req_id = c.post(f"{base}/documents/{doc_id}/open-requests",
+                        json={"reason": "定时", "deadline": deadline, "earliest_open_at": earliest},
+                        headers={"X-API-Key": owner}).json()["request_id"]
+        r = c.post(f"{base}/open-requests/{req_id}/approve", json={"digest": dg},
+                   headers={"X-API-Key": w1})
+        assert r.json()["status"] == "pending"
+        r = c.post(f"{base}/open-requests/{req_id}/approve", json={"digest": dg},
+                   headers={"X-API-Key": w2})
+        assert r.json()["status"] == "waiting"
+        assert "body" not in c.get(f"{base}/documents/{doc_id}", headers={"X-API-Key": owner}).text
+
+    # 等后台扫描器到点自动开封
+    deadline_ts = time.time() + 10
+    opened = False
+    with httpx.Client(timeout=10) as c:
+        h = {"X-API-Key": owner}
+        while time.time() < deadline_ts:
+            got = c.get(f"{base}/documents/{doc_id}", headers=h).json()
+            if got["status"] == "opened":
+                opened = True
+                break
+            time.sleep(0.1)
+        assert opened
+        got = c.get(f"{base}/documents/{doc_id}", headers=h).json()
+        assert got["body"] == body
+        # 开封后撤销拒绝
+        assert c.post(f"{base}/open-requests/{req_id}/revoke", json={"reason": "晚了"},
+                      headers=h).status_code == 409
+        # 审计只开封一次、无撤销/过期
+        records = c.get(f"{base}/documents/{doc_id}/audit", headers=h).json()["records"]
+        assert [r["action"] for r in records].count("opened") == 1
+        assert not {"revoked", "request_expired"} & {r["action"] for r in records}
+
+
+def test_due_waiting_recovered_after_restart(tmp_path, monkeypatch):
+    """服务停机期间到达最早开封时刻：重启时的恢复扫描必须把 waiting 开封。"""
+    db = tmp_path / "restart-sched.db"
+    monkeypatch.setenv("SEAL_DB_PATH", str(db))
+    monkeypatch.setenv("SWEEP_INTERVAL_SECONDS", "3600")  # 启动后不依赖周期扫描
+
+    import uvicorn
+
+    from app.main import app
+
+    def serve(port):
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        return server, thread
+
+    def wait_ready(base):
+        end = time.time() + 10
+        while time.time() < end:
+            try:
+                if httpx.get(base + "/health", timeout=1).status_code == 200:
+                    return
+            except Exception:
+                time.sleep(0.1)
+        pytest.fail("server did not start")
+
+    port1 = _free_port()
+    server1, thread1 = serve(port1)
+    base1 = f"http://127.0.0.1:{port1}"
+    wait_ready(base1)
+    try:
+        with httpx.Client(timeout=10) as c:
+            owner = _reg(c, base1, "rs-owner")
+            w1 = _reg(c, base1, "r1")
+            w2 = _reg(c, base1, "r2")
+            w3 = _reg(c, base1, "r3")
+            body = "停机期间到点正文 RESTART-SCHEDULED-SECRET"
+            dg = _digest(body)
+            doc_id = c.post(base1 + "/documents", json={"body": body, "witnesses": ["r1", "r2", "r3"]},
+                            headers={"X-API-Key": owner}).json()["document_id"]
+            earliest = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)).isoformat()
+            deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)).isoformat()
+            req_id = c.post(f"{base1}/documents/{doc_id}/open-requests",
+                            json={"reason": "停机到点", "deadline": deadline,
+                                  "earliest_open_at": earliest},
+                            headers={"X-API-Key": owner}).json()["request_id"]
+            c.post(f"{base1}/open-requests/{req_id}/approve", json={"digest": dg},
+                   headers={"X-API-Key": w1})
+            r = c.post(f"{base1}/open-requests/{req_id}/approve", json={"digest": dg},
+                       headers={"X-API-Key": w2})
+            assert r.json()["status"] == "waiting"
+    finally:
+        server1.should_exit = True
+        thread1.join(timeout=5)
+
+    # 等待最早开封时刻在“停机”期间流逝
+    time.sleep(1.2)
+
+    port2 = _free_port()
+    server2, thread2 = serve(port2)
+    base2 = f"http://127.0.0.1:{port2}"
+    wait_ready(base2)
+    try:
+        with httpx.Client(timeout=10) as c:
+            h = {"X-API-Key": owner}
+            got = c.get(f"{base2}/documents/{doc_id}", headers=h).json()
+            # 启动恢复扫描（sweep_once）已自动开封
+            assert got["status"] == "opened"
+            assert got["body"] == body
+            assert got["open_request"]["status"] == "opened"
+            records = c.get(f"{base2}/documents/{doc_id}/audit", headers=h).json()["records"]
+            assert [r["action"] for r in records].count("opened") == 1
+            assert "request_expired" not in [r["action"] for r in records]
+    finally:
+        server2.should_exit = True
+        thread2.join(timeout=5)
+
+
 def test_state_consistent_across_restart(live_server, monkeypatch):
     base, db_path = live_server
     with httpx.Client(timeout=10) as c:
