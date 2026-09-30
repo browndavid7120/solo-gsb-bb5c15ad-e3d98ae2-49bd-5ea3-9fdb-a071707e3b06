@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS open_requests (
     document_id  INTEGER NOT NULL REFERENCES documents(id),
     reason       TEXT NOT NULL,
     deadline     TEXT NOT NULL,            -- UTC，固定微秒精度，可直接按字典序比较
-    status       TEXT NOT NULL CHECK (status IN ('pending', 'opened', 'revoked', 'expired')),
+    earliest_open_at TEXT,                 -- 可选：定时开封的最早开封时刻（UTC）；NULL 表示两票即开封
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'scheduled', 'opened', 'revoked', 'expired')),
     created_at   TEXT NOT NULL,
     resolved_at  TEXT
 );
@@ -88,13 +89,75 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。"""
+    """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。
+
+    对旧版本库做一次幂等迁移：补 earliest_open_at 列并把 'scheduled' 纳入状态约束。
+    """
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+        _migrate_open_requests(conn)
     finally:
         conn.close()
+
+
+def _migrate_open_requests(conn: sqlite3.Connection) -> None:
+    """为旧库补充 earliest_open_at 列与 scheduled 状态约束（新库自动跳过）。"""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(open_requests)").fetchall()}
+    if cols:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='open_requests'"
+        ).fetchone()["sql"]
+        needs_rebuild = "earliest_open_at" not in cols or "'scheduled'" not in sql
+    else:
+        needs_rebuild = False
+
+    if not needs_rebuild:
+        return
+
+    # SQLite 不能修改列与 CHECK 约束：检测到旧结构时以重建表方式迁移，
+    # 迁移期间关闭外键并整体提交。
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE open_requests RENAME TO open_requests_old")
+            conn.execute(
+                """
+                CREATE TABLE open_requests (
+                    id           INTEGER PRIMARY KEY,
+                    document_id  INTEGER NOT NULL REFERENCES documents(id),
+                    reason       TEXT NOT NULL,
+                    deadline     TEXT NOT NULL,
+                    earliest_open_at TEXT,
+                    status       TEXT NOT NULL CHECK (status IN
+                                   ('pending', 'scheduled', 'opened', 'revoked', 'expired')),
+                    created_at   TEXT NOT NULL,
+                    resolved_at  TEXT
+                )
+                """
+            )
+            # 兼容不同演进版本：旧表可能已存在 earliest_open_at 列
+            old_cols = {r["name"] for r in conn.execute("PRAGMA table_info(open_requests_old)")}
+            earliest_select = "earliest_open_at" if "earliest_open_at" in old_cols else "NULL"
+            conn.execute(
+                f"""
+                INSERT INTO open_requests
+                    (id, document_id, reason, deadline, earliest_open_at,
+                     status, created_at, resolved_at)
+                SELECT id, document_id, reason, deadline, {earliest_select},
+                       status, created_at, resolved_at
+                FROM open_requests_old
+                """
+            )
+            conn.execute("DROP TABLE open_requests_old")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 @contextmanager

@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -69,6 +70,39 @@ def main() -> None:
 
     # 8. 摘要必须自行计算并一致
     assert hashlib.sha256(text.encode()).hexdigest() == digest
+
+    # 9. 定时开封（可选 earliest_open_at）：另封一份演示
+    text2 = "定时开封遗嘱正文：Python 示例"
+    _, sealed2 = call("POST", "/documents", owner,
+                      {"body": text2, "witnesses": ["bob", "carol", "dave"]})
+    doc2, digest2 = sealed2["document_id"], sealed2["digest"]
+    earliest = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)).isoformat()
+    deadline2 = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
+    _, req2 = call("POST", f"/documents/{doc2}/open-requests", owner,
+                   {"reason": "家庭会议定时开封", "deadline": deadline2,
+                    "earliest_open_at": earliest})
+    assert req2["earliest_open_at"] is not None
+    print("scheduled request:", req2["request_id"], req2["earliest_open_at"])
+
+    print("approve w1:", call("POST", f"/open-requests/{req2['request_id']}/approve", w1,
+                              {"digest": digest2})[1]["status"])
+    # 两票在最早时刻前集齐：只进入 scheduled，不开封
+    second = call("POST", f"/open-requests/{req2['request_id']}/approve", w2,
+                  {"digest": digest2})[1]
+    assert second["status"] == "scheduled", second
+    _, waiting = call("GET", f"/documents/{doc2}", owner)
+    assert waiting["status"] == "sealed" and "body" not in waiting
+    print("waiting status:", waiting["latest_open_request"]["status"],
+          waiting["latest_open_request"]["earliest_open_at"])
+
+    # 到点后由后台扫描自动开封（循环查询，最多等 10 秒）
+    for _ in range(50):
+        _, after2 = call("GET", f"/documents/{doc2}", owner)
+        if after2["status"] == "opened":
+            break
+        time.sleep(0.2)
+    assert after2["body"] == text2
+    print("scheduled open done:", after2["open_request"]["status"])
 
 
 if __name__ == "__main__":
